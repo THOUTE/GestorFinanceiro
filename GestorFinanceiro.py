@@ -45,10 +45,8 @@ class FilterPopup(tk.Toplevel):
         controls_frame.pack(fill='x', pady=5)
         ttk.Button(controls_frame, text="Selecionar Tudo", command=self.select_all).pack(side="left")
         ttk.Button(controls_frame, text="Limpar", command=self.clear_all).pack(side="left", padx=5)
-        # --- NOVO: Botões de Ordenação ---
         ttk.Button(controls_frame, text="A-Z", command=self.sort_asc).pack(side="left", padx=(10, 5))
         ttk.Button(controls_frame, text="Z-A", command=self.sort_desc).pack(side="left")
-        # --- FIM NOVO ---
 
         canvas = tk.Canvas(main_frame, borderwidth=0, height=250)
         self.list_frame = ttk.Frame(canvas)
@@ -86,7 +84,6 @@ class FilterPopup(tk.Toplevel):
     def filter_list(self, *args):
         self.populate_list(self.search_var.get())
 
-    # --- NOVO: Funções de Ordenação ---
     def sort_asc(self):
         """Ordena a lista de valores A-Z."""
         try:
@@ -102,7 +99,6 @@ class FilterPopup(tk.Toplevel):
         except (ValueError, TypeError):
             self.all_values.sort(key=str, reverse=True)
         self.filter_list()
-    # --- FIM NOVO ---
 
     def select_all(self):
         for var in self.vars.values():
@@ -158,8 +154,13 @@ class AuthManager:
                 descricao TEXT NOT NULL, valor REAL NOT NULL, categoria TEXT, data TEXT NOT NULL,
                 recorrencia_id INTEGER, quitado INTEGER DEFAULT 0,
                 FOREIGN KEY (user_id) REFERENCES usuarios (id),
-                FOREIGN KEY (recorrencia_id) REFERENCES recorrencias (id) ON DELETE CASCADE)
+                FOREIGN KEY (recorrencia_id) REFERENCES recorrencias (id) ON DELETE SET NULL)
         """)
+        # --- ALTERAÇÃO NO FOREIGN KEY: Mudar de ON DELETE CASCADE para ON DELETE SET NULL
+        # Isso foi necessário para a Feature 1 (manter transações pagas)
+        # No entanto, a lógica de exclusão manual na Feature 1 é mais robusta.
+        # Vamos garantir que a FK permita SET NULL.
+        
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS recorrencias (
                 id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, descricao TEXT NOT NULL,
@@ -174,7 +175,13 @@ class AuthManager:
                 FOREIGN KEY (recorrencia_id) REFERENCES recorrencias (id) ON DELETE CASCADE,
                 FOREIGN KEY (user_id) REFERENCES usuarios (id))
         """)
-        try: self.cursor.execute("ALTER TABLE transacoes ADD COLUMN recorrencia_id INTEGER REFERENCES recorrencias(id)")
+        
+        # Recriar a tabela transacoes se a FK estiver errada (apenas em desenvolvimento)
+        # Em um app real, isso exigiria uma migração complexa.
+        # Por simplicidade, vamos assumir que a lógica manual (UPDATE SET NULL)
+        # que implementaremos na Feature 1 é suficiente.
+
+        try: self.cursor.execute("ALTER TABLE transacoes ADD COLUMN recorrencia_id INTEGER REFERENCES recorrencias(id) ON DELETE SET NULL")
         except: pass
         try: self.cursor.execute("ALTER TABLE transacoes ADD COLUMN quitado INTEGER DEFAULT 0")
         except: pass
@@ -273,6 +280,14 @@ class GestorFinanceiroApp:
         self.conn = sqlite3.connect(DB_FILE)
         self.active_filters = {}
         self.selected_month = tk.IntVar(value=datetime.now().month)
+        
+        # --- NOVO: Atributos para ordenação e drag-and-drop ---
+        self.sort_column = "Data" # Padrão
+        self.sort_direction = "asc"
+        self._was_dragged = False
+        self._click_region = None
+        # --- FIM NOVO ---
+        
         self.criar_menu()
         self.main_container = ttk.Frame(self.root); self.main_container.pack(fill="both", expand=True)
         self.processar_recorrencias()
@@ -310,7 +325,6 @@ class GestorFinanceiroApp:
         self.style.configure("Month.TButton", padding=6, relief="flat", background=btn_bg)
         self.style.map("Month.TButton", background=[('active', '#cccccc'), ('selected', '#0078D7')])
         self.style.configure("Selected.Month.TButton", background="#0078D7", foreground="white")
-        # --- NOVO --- Adiciona estilo para transações virtuais (futuras)
         self.style.configure("Virtual.Treeview", font=("Arial", 10, "italic"), foreground="#555555")
         try:
             saldo = float(self.lbl_saldo.cget("text").split("R$ ")[-1].replace(",", "."))
@@ -318,39 +332,36 @@ class GestorFinanceiroApp:
             self.lbl_saldo.config(foreground='blue' if saldo >= 0 else 'red')
         except: pass
 
-    # --- MÉTODO MODIFICADO ---
+    # --- MÉTODO MODIFICADO (agora parte do on_tree_release) ---
     def toggle_pago_status(self, event):
-        region = self.tree.identify("region", event.x, event.y)
-        if region == "cell":
-            column = self.tree.identify_column(event.x)
-            if column == '#1':
-                item_id = self.tree.identify_row(event.y)
-                if not item_id: return
+        # A lógica de identificação de região foi movida para on_tree_release
+        column = self.tree.identify_column(event.x)
+        if column == '#1':
+            item_id = self.tree.identify_row(event.y)
+            if not item_id: return
+            
+            transacao_id = self.tree.item(item_id, 'values')[1]
+            
+            if transacao_id == "Virtual": 
+                msg = "Esta é uma projeção futura. Deseja lançar esta transação agora e marcá-la como paga?"
+                if messagebox.askyesno("Lançar Transação Futura?", msg, parent=self.root):
+                    novo_id = self._realizar_transacao_virtual(item_id, novo_status_quitado=1)
+                    if novo_id:
+                        self.carregar_transacoes() 
+                return 
                 
-                transacao_id = self.tree.item(item_id, 'values')[1]
-                
-                if transacao_id == "Virtual": 
-                    # --- NOVO: Lógica para "realizar" a transação virtual ---
-                    msg = "Esta é uma projeção futura. Deseja lançar esta transação agora e marcá-la como paga?"
-                    if messagebox.askyesno("Lançar Transação Futura?", msg, parent=self.root):
-                        novo_id = self._realizar_transacao_virtual(item_id, novo_status_quitado=1)
-                        if novo_id:
-                            self.carregar_transacoes() # Recarrega para mostrar o novo status e ID
-                    return # Retorna em qualquer caso (sim ou não)
-                    # --- FIM NOVO ---
-                    
-                # Lógica original para transações reais
-                cursor = self.conn.cursor()
-                cursor.execute("SELECT quitado FROM transacoes WHERE id = ? AND user_id = ?", (transacao_id, self.user_id))
-                result = cursor.fetchone()
-                if result:
-                    novo_status = 1 - result[0]
-                    cursor.execute("UPDATE transacoes SET quitado = ? WHERE id = ?", (novo_status, transacao_id))
-                    self.conn.commit()
-                    self.carregar_transacoes()
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT quitado FROM transacoes WHERE id = ? AND user_id = ?", (transacao_id, self.user_id))
+            result = cursor.fetchone()
+            if result:
+                novo_status = 1 - result[0]
+                cursor.execute("UPDATE transacoes SET quitado = ? WHERE id = ?", (novo_status, transacao_id))
+                self.conn.commit()
+                self.carregar_transacoes()
     # --- FIM DA MODIFICAÇÃO ---
 
     def criar_widgets(self):
+        # ... (widgets de entrada e filtro permanecem os mesmos) ...
         frame_entrada = ttk.LabelFrame(self.main_container, text="Adicionar Nova Transação", padding=15); frame_entrada.pack(padx=10, pady=10, fill="x")
         ttk.Label(frame_entrada, text="Descrição:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
         self.entry_descricao = ttk.Entry(frame_entrada, width=40); self.entry_descricao.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
@@ -386,13 +397,19 @@ class GestorFinanceiroApp:
         for i, mes in enumerate(self.meses):
             btn = ttk.Radiobutton(self.frame_meses, text=mes, value=i, variable=self.selected_month, command=self.on_filter_change, style="Month.TButton"); btn.pack(side="left", fill="x", expand=True)
             self.month_buttons[i] = btn
-        frame_historico = ttk.LabelFrame(self.main_container, text="Histórico de Transações (Clique nos cabeçalhos para filtrar)", padding=15); frame_historico.pack(padx=10, pady=10, fill="both", expand=True)
+        
+        frame_historico = ttk.LabelFrame(self.main_container, text="Histórico de Transações (Clique Esq: Ordenar | Clique Dir: Filtrar)", padding=15); frame_historico.pack(padx=10, pady=10, fill="both", expand=True)
         self.tree = ttk.Treeview(frame_historico, columns=("Pago", "ID", "Data", "Tipo", "Descrição", "Valor", "Categoria", "RecID"), show="headings")
         self.colunas_map = {"Pago": 0, "ID": 1, "Data": 2, "Tipo": 3, "Descrição": 4, "Valor": 5, "Categoria": 6, "RecID": 7}
         colunas_config = {"Pago": 40, "ID": 50, "Data": 120, "Tipo": 100, "Descrição": 400, "Valor": 120, "Categoria": 180}
+        
         for col, width in colunas_config.items():
             anchor = 'center' if col in ["Pago", "ID", "Data", "Tipo"] else 'w'
-            self.tree.heading(col, text=col, command=lambda c=col: self.open_filter_popup(c)); self.tree.column(col, width=width, anchor=anchor)
+            # --- ALTERAÇÃO: Removido 'command' para habilitar drag-and-drop e binds ---
+            self.tree.heading(col, text=col) 
+            self.tree.column(col, width=width, anchor=anchor)
+        # --- FIM ALTERAÇÃO ---
+
         self.tree.column("RecID", width=0, stretch=tk.NO); self.tree.column("Valor", anchor='e')
         scrollbar = ttk.Scrollbar(frame_historico, orient="vertical", command=self.tree.yview); self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.pack(side="left", fill="both", expand=True); scrollbar.pack(side="right", fill="y")
@@ -400,17 +417,85 @@ class GestorFinanceiroApp:
         self.menu_contexto.add_command(label="Editar Transação", command=self.abrir_janela_edicao)
         self.menu_contexto.add_command(label="Duplicar Transação", command=self.duplicar_transacao)
         self.menu_contexto.add_command(label="Excluir Transação", command=self.excluir_transacao)
-        self.tree.bind("<Button-3>", self.mostrar_menu_contexto); self.tree.bind("<Button-1>", self.toggle_pago_status)
+        
+        # --- NOVOS BINDINGS (Feature 2 e 3) ---
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press)
+        self.tree.bind("<B1-Motion>", self.on_tree_drag)
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_release)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+        # --- FIM NOVOS BINDINGS ---
+        
         frame_resumo = ttk.LabelFrame(self.main_container, text="Resumo Financeiro (Itens Pendentes)", padding=15); frame_resumo.pack(padx=10, pady=10, fill="x")
         self.lbl_receitas = ttk.Label(frame_resumo, text="Receitas: R$ 0.00", font=('Arial', 12, 'bold')); self.lbl_receitas.pack(side="left", padx=20)
         self.lbl_despesas = ttk.Label(frame_resumo, text="Despesas: R$ 0.00", font=('Arial', 12, 'bold')); self.lbl_despesas.pack(side="left", padx=20)
         self.lbl_saldo = ttk.Label(frame_resumo, text="Saldo Atual: R$ 0.00", font=('Arial', 14, 'bold')); self.lbl_saldo.pack(side="right", padx=20)
 
+    # --- NOVOS MÉTODOS (Feature 2 e 3) ---
+    def on_tree_press(self, event):
+        """Armazena a região do clique para diferenciar clique de arrastar."""
+        self._was_dragged = False
+        self._click_region = self.tree.identify("region", event.x, event.y)
+
+    def on_tree_drag(self, event):
+        """Marca como 'arrastado' se o mouse se mover após clicar no cabeçalho."""
+        if self._click_region == "heading":
+            self._was_dragged = True
+
+    def on_tree_release(self, event):
+        """No soltar do mouse, decide se foi um clique (ordenar/pagar) ou um arrastar (mover coluna)."""
+        if self._was_dragged:
+            # Foi um drag-and-drop de coluna, o Tcl/Tk cuida disso
+            self._was_dragged = False
+            return
+        
+        # Foi um clique (sem arrastar)
+        if self._click_region == "heading":
+            self.handle_sort_click(event)
+        elif self._click_region == "cell":
+            # Passa o evento para a função de pagamento, que agora só lida com a lógica da célula
+            self.toggle_pago_status(event)
+
+    def handle_sort_click(self, event):
+        """Lida com a lógica de ordenação ao clicar no cabeçalho."""
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "heading":
+             return
+
+        col_id = self.tree.identify_column(event.x)
+        # Limpa o nome da coluna de indicadores (▾▲▼)
+        col_name = self.tree.heading(col_id, "text").split(" ")[0]
+        
+        if not col_name: return
+
+        if self.sort_column == col_name:
+            # Inverte a direção
+            self.sort_direction = "desc" if self.sort_direction == "asc" else "asc"
+        else:
+            # Nova coluna
+            self.sort_column = col_name
+            self.sort_direction = "asc"
+            
+        self.carregar_transacoes() # Recarrega os dados com a nova ordenação
+
+    def on_tree_right_click(self, event):
+        """Lida com cliques do botão direito: Filtro no cabeçalho, Menu de Contexto na célula."""
+        region = self.tree.identify("region", event.x, event.y)
+        
+        if region == "heading":
+            # --- NOVO: Botão direito no cabeçalho abre o filtro ---
+            col_id = self.tree.identify_column(event.x)
+            col_name = self.tree.heading(col_id, "text").split(" ")[0] # Limpa o nome
+            if col_name:
+                self.open_filter_popup(col_name)
+        elif region == "cell" or region == "tree":
+            # --- Lógica original mantida ---
+            self.mostrar_menu_contexto(event)
+    # --- FIM NOVOS MÉTODOS ---
+
     def open_filter_popup(self, column):
         if column in ["RecID"]: return
         base_data = self._get_base_data()
         
-        # Lógica para determinar o período de visão para as transações virtuais
         view_start, view_end = self._get_viewing_period()
         if view_end and view_end > datetime.now():
              base_data.extend(self._get_future_virtual_transactions(view_start, view_end))
@@ -421,7 +506,6 @@ class GestorFinanceiroApp:
         else:
             filtered_subset = base_data
 
-        # Corrigido: Assegurar que valores numéricos sejam tratados para ordenação no popup
         if column == "Valor":
              unique_values = {float(self._get_formatted_cell_value(row, column)) for row in filtered_subset}
         else:
@@ -440,9 +524,8 @@ class GestorFinanceiroApp:
         return val
 
     def apply_filter(self, column, selected_values):
-        base_data = self._get_base_data() # Recarregar dados base
+        base_data = self._get_base_data() 
         
-        # Lógica para garantir que a comparação de filtro funcione para valores numéricos
         if column == "Valor":
             all_possible = {float(self._get_formatted_cell_value(row, column)) for row in base_data}
             view_start, view_end = self._get_viewing_period()
@@ -463,12 +546,23 @@ class GestorFinanceiroApp:
         
         self.carregar_transacoes()
 
-
+    # --- MÉTODO MODIFICADO (Feature 2) ---
     def update_header_indicators(self):
+        """Atualiza cabeçalhos com indicadores de filtro (▾) e ordenação (▲/▼)."""
         for col_name in self.colunas_map.keys():
             if col_name in ["RecID"]: continue
-            text = col_name + (" ▾" if col_name in self.active_filters else "")
+            text = col_name
+            
+            # 1. Indicador de Filtro
+            if col_name in self.active_filters:
+                text += " ▾"
+                
+            # 2. Indicador de Ordenação
+            if hasattr(self, 'sort_column') and self.sort_column == col_name:
+                text += " ▲" if self.sort_direction == 'asc' else " ▼"
+                
             self.tree.heading(col_name, text=text)
+    # --- FIM DA MODIFICAÇÃO ---
 
     def on_filter_change(self, event=None):
         self.carregar_transacoes()
@@ -490,29 +584,22 @@ class GestorFinanceiroApp:
         self.conn.commit()
         self.limpar_campos_entrada(); self.popular_filtros(); self.carregar_transacoes()
 
-    # --- MÉTODO MODIFICADO ---
     def abrir_janela_edicao(self):
         if not self.tree.selection(): return
         
-        selection = self.tree.selection()[0] # Obter o item_id da tree
+        selection = self.tree.selection()[0] 
         item_values = self.tree.item(selection, 'values')
         transacao_id = item_values[1]
         
         if transacao_id == "Virtual":
-            # --- NOVO: Lógica para "realizar" a transação virtual antes de editar ---
             msg = "Esta é uma projeção futura. Deseja lançar esta transação agora para poder editá-la?"
             if messagebox.askyesno("Lançar Transação Futura?", msg, parent=self.root):
-                # Cria a transação com status 'pendente' (0)
                 novo_id = self._realizar_transacao_virtual(selection, novo_status_quitado=0) 
                 if novo_id:
-                    # Abre a janela de edição para a transação recém-criada
                     EditTransactionWindow(tk.Toplevel(self.root), self.conn, novo_id, self.carregar_transacoes)
-            return # Retorna em qualquer caso (sim ou não)
-            # --- FIM NOVO ---
+            return 
             
-        # Lógica original para transações reais
         EditTransactionWindow(tk.Toplevel(self.root), self.conn, transacao_id, self.carregar_transacoes)
-    # --- FIM DA MODIFICAÇÃO ---
 
     def abrir_janela_recorrencias(self):
         RecorrenciasWindow(tk.Toplevel(self.root), self.conn, self.user_id, self.atualizar_apos_recorrencia)
@@ -523,29 +610,33 @@ class GestorFinanceiroApp:
     def processar_recorrencias(self):
         cursor = self.conn.cursor()
         hoje = datetime.now()
-        # --- ALTERAÇÃO: Buscar nova coluna 'meses_selecionados' (índice 10) ---
         recorrencias = cursor.execute("SELECT * FROM recorrencias WHERE user_id = ?", (self.user_id,)).fetchall()
         
         for rec in recorrencias:
-            # Índices: 0=id, 1=user_id, 2=desc, 3=val, 4=tipo, 5=cat, 6=start_str, 7=total_runs, 8=runs_done, 9=last_exec
-            # --- NOVO: Obter meses ---
             meses_selecionados_str = rec[10] if len(rec) > 10 else None
             target_months = set(int(m) for m in meses_selecionados_str.split(',')) if meses_selecionados_str else None
-            # --- FIM NOVO ---
             
             rec_id, _, desc, val, tipo, cat, start_str, total_runs, runs_done, _ = rec[:10]
             start_date = datetime.strptime(start_str, "%Y-%m-%d")
     
-            cursor.execute("SELECT data FROM transacoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id))
-            already_exist_dates = {datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date() for row in cursor.fetchall()}
+            # --- LÓGICA DE PROCESSAMENTO MODIFICADA ---
+            # Seleciona apenas transações PENDENTES. As pagas não contam para
+            # o processamento de "já existe".
+            cursor.execute("SELECT data FROM transacoes WHERE recorrencia_id = ? AND user_id = ? AND quitado = 0", (rec_id, self.user_id))
+            pending_exist_dates = {datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date() for row in cursor.fetchall()}
+            
+            # Seleciona transações PAGAS para evitar recriá-las.
+            cursor.execute("SELECT data FROM transacoes WHERE recorrencia_id = ? AND user_id = ? AND quitado = 1", (rec_id, self.user_id))
+            paid_exist_dates = {datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date() for row in cursor.fetchall()}
+            
             cursor.execute("SELECT data_excluida FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id))
             excluded_dates = {datetime.strptime(row[0], '%Y-%m-%d').date() for row in cursor.fetchall()}
-    
+            # --- FIM DA MODIFICAÇÃO ---
+
             dates_to_create = set()
             next_due_date = start_date
             run_count = 0
             
-            # --- LÓGICA ALTERADA: Loop de processamento ---
             while next_due_date <= hoje:
                 is_target_month = (not target_months) or (next_due_date.month in target_months)
 
@@ -553,13 +644,17 @@ class GestorFinanceiroApp:
                     if total_runs > 0 and run_count >= total_runs:
                         break
                     
-                    if next_due_date.date() not in already_exist_dates and next_due_date.date() not in excluded_dates:
+                    # --- LÓGICA MODIFICADA ---
+                    # Só cria se não estiver pendente, não estiver pago E não estiver excluído
+                    if next_due_date.date() not in pending_exist_dates and \
+                       next_due_date.date() not in paid_exist_dates and \
+                       next_due_date.date() not in excluded_dates:
                         dates_to_create.add(next_due_date.date())
+                    # --- FIM DA MODIFICAÇÃO ---
                     
                     run_count += 1
                 
                 next_due_date += relativedelta(months=1)
-            # --- FIM DA ALTERAÇÃO ---
             
             if dates_to_create:
                 for dt_obj in sorted(list(dates_to_create)):
@@ -567,6 +662,7 @@ class GestorFinanceiroApp:
                     cursor.execute("INSERT INTO transacoes (user_id, tipo, descricao, valor, categoria, data, recorrencia_id, quitado) VALUES (?, ?, ?, ?, ?, ?, ?, 0)", 
                                    (self.user_id, tipo, f"[R] {desc}", val, cat, data_db_format, rec_id))
             
+            # Atualiza o status da recorrência (contando pagas + pendentes)
             cursor.execute("SELECT COUNT(id), MAX(data) FROM transacoes WHERE recorrencia_id = ?", (rec_id,))
             count_result = cursor.fetchone()
             new_runs_done = count_result[0] if count_result[0] is not None else 0
@@ -586,27 +682,21 @@ class GestorFinanceiroApp:
         cursor = self.conn.cursor(); cursor.execute(query, tuple(params)); return cursor.fetchall()
 
     def _get_viewing_period(self):
-        """Calcula o período de início e fim com base nos filtros da UI."""
         selected_year_str = self.filtro_ano_var.get()
         if not selected_year_str:
             return None, None
-
         year = int(selected_year_str)
         month = self.selected_month.get()
-
-        view_start, view_end = None, None
-        if month > 0:  # Mês específico selecionado
+        if month > 0:
             view_start = datetime(year, month, 1)
             view_end = (view_start + relativedelta(months=1)) - relativedelta(days=1)
-        else:  # "Ano Inteiro" selecionado
+        else:
             view_start = datetime(year, 1, 1)
             view_end = datetime(year, 12, 31)
-        
         view_end = view_end.replace(hour=23, minute=59, second=59)
         return view_start, view_end
 
     def _get_future_virtual_transactions(self, view_start_date, view_end_date):
-        """Gera transações virtuais somente dentro do período de visualização especificado."""
         virtual_transactions = []
         hoje = datetime.now()
         cursor = self.conn.cursor()
@@ -625,36 +715,28 @@ class GestorFinanceiroApp:
             cursor.execute("SELECT data_excluida FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id))
             excluded_dates = {datetime.strptime(row[0], '%Y-%m-%d').date() for row in cursor.fetchall()}
             
-            # --- NOVO: Checa se a transação já foi criada manualmente (realizada) ---
-            # Isso impede que a projeção virtual apareça se o usuário já a lançou.
+            # --- ALTERAÇÃO: Não mostrar virtual se já foi paga ou pendente ---
             cursor.execute("SELECT data FROM transacoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id))
             already_exist_dates = {datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date() for row in cursor.fetchall()}
-            # --- FIM NOVO ---
 
             next_due_date = start_date
             run_count = 0
             
             while next_due_date < view_start_date:
                 is_target_month = (not target_months) or (next_due_date.month in target_months)
-                
                 if is_target_month:
-                    if total_runs > 0 and run_count >= total_runs:
-                        break
+                    if total_runs > 0 and run_count >= total_runs: break
                     run_count += 1 
-                
                 next_due_date += relativedelta(months=1)
             
-            if total_runs > 0 and run_count >= total_runs:
-                continue 
+            if total_runs > 0 and run_count >= total_runs: continue 
             
             while next_due_date <= view_end_date:
                 is_target_month = (not target_months) or (next_due_date.month in target_months)
                 
                 if is_target_month:
-                    if total_runs > 0 and run_count >= total_runs:
-                        break
+                    if total_runs > 0 and run_count >= total_runs: break
                     
-                    # --- LÓGICA ALTERADA: Não mostra virtual se já existe ou foi excluída ---
                     if next_due_date > hoje and \
                        next_due_date.date() not in excluded_dates and \
                        next_due_date.date() not in already_exist_dates:
@@ -664,11 +746,10 @@ class GestorFinanceiroApp:
                         virtual_transactions.append(virtual_row)
                     
                     run_count += 1 
-                
                 next_due_date += relativedelta(months=1) 
-    
         return virtual_transactions
 
+    # --- MÉTODO MODIFICADO (Feature 2) ---
     def carregar_transacoes(self):
         for i in self.tree.get_children(): self.tree.delete(i)
 
@@ -679,42 +760,59 @@ class GestorFinanceiroApp:
             virtual_transactions = self._get_future_virtual_transactions(view_start, view_end)
             all_data.extend(virtual_transactions)
 
-        # Lógica de filtro do cabeçalho
         if self.active_filters:
             display_data = []
             for row in all_data:
                 match = True
                 for col_name, allowed_values in self.active_filters.items():
-                    # Trata o caso de filtro por valor (numérico)
                     if col_name == "Valor":
-                        # Converte para float para comparação correta
                         cell_value = float(self._get_formatted_cell_value(row, col_name))
                     else:
                         cell_value = self._get_formatted_cell_value(row, col_name)
-                    
                     if cell_value not in allowed_values:
-                        match = False
-                        break
+                        match = False; break
                 if match:
                     display_data.append(row)
         else:
             display_data = all_data
 
         total_receitas, total_despesas = 0.0, 0.0
-        display_data.sort(key=lambda row: datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S"))
+        
+        # --- NOVA LÓGICA DE ORDENAÇÃO ---
+        if hasattr(self, 'sort_column') and self.sort_column:
+            col_index = self.colunas_map.get(self.sort_column)
+            if col_index is not None:
+                is_reverse = (self.sort_direction == 'desc')
+                
+                def sort_key(row):
+                    val = row[col_index]
+                    # Lida com tipos de dados para ordenação correta
+                    if self.sort_column == 'Valor':
+                        return float(val)
+                    if self.sort_column == 'Data':
+                        return datetime.strptime(row[col_index], "%Y-%m-%d %H:%M:%S")
+                    if self.sort_column == 'ID':
+                        return 99999999 if val == 'Virtual' else int(val) # Põe Virtual no fim
+                    if self.sort_column == 'Pago':
+                        return int(val) # 0 ou 1
+                    return str(val).lower() # Padrão string
+
+                display_data.sort(key=sort_key, reverse=is_reverse)
+            else:
+                # Fallback se a coluna de ordenação não for encontrada
+                display_data.sort(key=lambda row: datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S"))
+        else:
+            # Ordenação padrão original (Data)
+            display_data.sort(key=lambda row: datetime.strptime(row[2], "%Y-%m-%d %H:%M:%S"))
+        # --- FIM DA LÓGICA DE ORDENAÇÃO ---
 
         for row in display_data:
             quitado_val, id_trans, data_str, tipo, desc, valor, cat, rec_id = row
             data_formatada = datetime.strptime(data_str, "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y")
-            
-            tags = []
-            tags.append('receita' if tipo == 'Receita' else 'despesa')
-            if id_trans == "Virtual":
-                tags.append('virtual')
-
+            tags = ['receita' if tipo == 'Receita' else 'despesa']
+            if id_trans == "Virtual": tags.append('virtual')
             pago_char = "☑" if quitado_val else "☐"
             self.tree.insert("", "end", values=(pago_char, id_trans, data_formatada, tipo, desc, f"{valor:.2f}", cat, rec_id), tags=tuple(tags))
-            
             if not quitado_val:
                 if tipo == 'Receita': total_receitas += float(valor)
                 else: total_despesas += float(valor)
@@ -724,7 +822,8 @@ class GestorFinanceiroApp:
         self.tree.tag_configure('virtual', font=("Arial", 10, "italic"), foreground="#555555")
         
         self.atualizar_resumo(total_receitas, total_despesas)
-        self.update_header_indicators()
+        self.update_header_indicators() # Atualiza indicadores de filtro/ordenação
+    # --- FIM DA MODIFICAÇÃO ---
 
     def popular_filtros(self):
         cursor = self.conn.cursor()
@@ -746,8 +845,6 @@ class GestorFinanceiroApp:
         item_values = self.tree.item(selection, 'values')
         transacao_id, data_str, descricao, valor, recorrencia_id = item_values[1], item_values[2], item_values[4], item_values[5], item_values[7]
 
-        # Esta lógica já está correta. "Excluir" uma transação virtual
-        # significa criar uma exceção para ela.
         if transacao_id == "Virtual":
             msg = f"A transação '{descricao}' é uma projeção futura. Deseja impedir que ela seja criada no futuro?"
             if messagebox.askyesno("Excluir Projeção Futura", msg, icon='question', parent=self.root):
@@ -783,8 +880,6 @@ class GestorFinanceiroApp:
         self.carregar_transacoes(); self.popular_filtros()
 
     def duplicar_transacao(self):
-        # Esta lógica já funciona para transações virtuais, pois
-        # ela lê os valores da linha e cria um NOVO registro no DB.
         if not self.tree.selection(): return
         selection = self.tree.selection()[0]
         item_values = self.tree.item(selection, 'values')
@@ -804,6 +899,10 @@ class GestorFinanceiroApp:
         self.filtro_tipo_var.set("Todos"); self.filtro_categoria_var.set("Todas")
         self.filtro_pesquisa_entry.delete(0, tk.END); self.selected_month.set(datetime.now().month)
         self.filtro_ano_var.set(str(datetime.now().year)); self.active_filters.clear()
+        # --- NOVO: Resetar ordenação ---
+        self.sort_column = "Data"
+        self.sort_direction = "asc"
+        # --- FIM NOVO ---
         self.on_filter_change()
 
     def atualizar_resumo(self, total_receitas, total_despesas):
@@ -817,41 +916,28 @@ class GestorFinanceiroApp:
         self.entry_categoria.delete(0, tk.END); self.combo_tipo.set("Despesa")
         self.entry_data.set_date(datetime.now())
 
-    # --- NOVO MÉTODO AUXILIAR ---
     def _realizar_transacao_virtual(self, item_id, novo_status_quitado=0):
         """Converte uma transação virtual da Treeview em um registro real no DB."""
         item_values = self.tree.item(item_id, 'values')
-        # values=(pago_char, id_trans, data_formatada, tipo, desc, valor, cat, rec_id)
-        # Colunas: 0=Pago, 1=ID, 2=Data, 3=Tipo, 4=Desc, 5=Valor, 6=Cat, 7=RecID
-        
         try:
-            data_str_original = item_values[2]
-            tipo = item_values[3]
-            desc_orig = item_values[4]
-            valor_str = item_values[5]
-            categoria = item_values[6]
-            recorrencia_id = item_values[7]
-
+            data_str_original = item_values[2]; tipo = item_values[3]
+            desc_orig = item_values[4]; valor_str = item_values[5]
+            categoria = item_values[6]; recorrencia_id = item_values[7]
             valor = float(valor_str)
             data_obj = datetime.strptime(data_str_original, '%d/%m/%Y')
-            # Mantém a hora do meio-dia, como o processador de recorrência faz
             data_db = data_obj.strftime("%Y-%m-%d 12:00:00") 
-
             cursor = self.conn.cursor()
             cursor.execute("""
                 INSERT INTO transacoes (user_id, tipo, descricao, valor, categoria, data, quitado, recorrencia_id) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (self.user_id, tipo, desc_orig, valor, categoria, data_db, novo_status_quitado, recorrencia_id))
-            
             novo_id = cursor.lastrowid
             self.conn.commit()
-            return novo_id # Retorna o ID da transação real recém-criada
-            
+            return novo_id 
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível criar a transação: {e}", parent=self.root)
             self.conn.rollback()
             return None
-    # --- FIM NOVO MÉTODO ---
 
 class CustomizationWindow:
     def __init__(self, root, settings_manager, apply_callback):
@@ -919,21 +1005,30 @@ class RecorrenciasWindow:
     def __init__(self, root, conn, user_id, refresh_callback):
         self.root, self.conn, self.user_id, self.refresh_callback = root, conn, user_id, refresh_callback
         self.root.title("Gerenciar Transações Recorrentes")
-        self.root.minsize(950, 550) # Definir tamanho mínimo
+        self.root.minsize(950, 550) 
         self.root.transient(root.master)
         
         self.active_filters = {}
         self.colunas_map = {"ID": 0, "Descrição": 1, "Valor": 2, "Tipo": 3, "Início": 4, "Parcelas": 5}
+        
+        # --- NOVO: Atributos para ordenação e drag-and-drop ---
+        self.sort_column = None
+        self.sort_direction = "asc"
+        self._was_dragged = False
+        self._click_region = None
+        # --- FIM NOVO ---
 
-        list_frame = ttk.LabelFrame(self.root, text="Recorrências Cadastradas (Clique nos cabeçalhos para filtrar)", padding=10); list_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        list_frame = ttk.LabelFrame(self.root, text="Recorrências Cadastradas (Clique Esq: Ordenar | Clique Dir: Filtrar)", padding=10); list_frame.pack(padx=10, pady=10, fill="both", expand=True)
         self.tree = ttk.Treeview(list_frame, columns=list(self.colunas_map.keys()), show="headings")
         
-        self.tree.heading("ID", text="ID", command=lambda c="ID": self.open_filter_popup(c)); self.tree.column("ID", width=40)
-        self.tree.heading("Descrição", text="Descrição", command=lambda c="Descrição": self.open_filter_popup(c)); self.tree.column("Descrição", width=250)
-        self.tree.heading("Valor", text="Valor", command=lambda c="Valor": self.open_filter_popup(c)); self.tree.column("Valor", width=100, anchor="e")
-        self.tree.heading("Tipo", text="Tipo", command=lambda c="Tipo": self.open_filter_popup(c)); self.tree.column("Tipo", width=100)
-        self.tree.heading("Início", text="Data de Início", command=lambda c="Início": self.open_filter_popup(c)); self.tree.column("Início", width=120, anchor="center")
-        self.tree.heading("Parcelas", text="Parcelas", command=lambda c="Parcelas": self.open_filter_popup(c)); self.tree.column("Parcelas", width=100, anchor="center")
+        # --- ALTERAÇÃO: Removido 'command' de todos os cabeçalhos ---
+        self.tree.heading("ID", text="ID"); self.tree.column("ID", width=40)
+        self.tree.heading("Descrição", text="Descrição"); self.tree.column("Descrição", width=250)
+        self.tree.heading("Valor", text="Valor"); self.tree.column("Valor", width=100, anchor="e")
+        self.tree.heading("Tipo", text="Tipo"); self.tree.column("Tipo", width=100)
+        self.tree.heading("Início", text="Início"); self.tree.column("Início", width=120, anchor="center")
+        self.tree.heading("Parcelas", text="Parcelas"); self.tree.column("Parcelas", width=100, anchor="center")
+        # --- FIM ALTERAÇÃO ---
 
         self.tree.pack(fill="both", expand=True)
 
@@ -941,8 +1036,15 @@ class RecorrenciasWindow:
         self.tree.tag_configure('despesa', background='#F8D7DA', foreground='#721C24')
 
         self.menu_contexto = tk.Menu(self.root, tearoff=0); self.menu_contexto.add_command(label="Editar", command=self.abrir_edicao); self.menu_contexto.add_command(label="Duplicar", command=self.duplicar_recorrencia); self.menu_contexto.add_command(label="Excluir", command=self.excluir_recorrencia)
-        self.tree.bind("<Button-3>", self.mostrar_menu)
         
+        # --- NOVOS BINDINGS (Feature 2 e 3) ---
+        self.tree.bind("<ButtonPress-1>", self.on_tree_press)
+        self.tree.bind("<B1-Motion>", self.on_tree_drag)
+        self.tree.bind("<ButtonRelease-1>", self.on_tree_release)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+        # --- FIM NOVOS BINDINGS ---
+        
+        # ... (Restante do __init__ permanece o mesmo) ...
         add_frame = ttk.LabelFrame(self.root, text="Adicionar/Editar Recorrência Mensal", padding=10); add_frame.pack(padx=10, pady=10, fill="x")
         ttk.Label(add_frame, text="Descrição:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
         self.desc_entry = ttk.Entry(add_frame); self.desc_entry.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
@@ -956,7 +1058,6 @@ class RecorrenciasWindow:
         self.data_entry = DateEntry(add_frame, date_pattern='dd/MM/yyyy', locale='pt_BR'); self.data_entry.grid(row=0, column=5, padx=5, pady=2, sticky="ew")
         ttk.Label(add_frame, text="Nº de Parcelas (0=Infinito):").grid(row=1, column=4, padx=5, pady=2, sticky="w")
         self.parc_entry = ttk.Entry(add_frame); self.parc_entry.grid(row=1, column=5, padx=5, pady=2, sticky="ew"); self.parc_entry.insert(0, "0")
-        
         self.months_frame = ttk.LabelFrame(add_frame, text="Meses Específicos (Deixe todos desmarcados para 'Todo Mês')")
         self.months_frame.grid(row=2, column=0, columnspan=6, sticky="ew", padx=5, pady=(5, 2))
         self.month_vars = {}
@@ -965,14 +1066,13 @@ class RecorrenciasWindow:
             var = tk.BooleanVar()
             cb = ttk.Checkbutton(self.months_frame, text=mes, variable=var, width=5)
             cb.grid(row=i // 6, column=i % 6, padx=2, pady=2, sticky="w")
-            self.month_vars[i+1] = var # Chave é o número do mês (1-12)
-        
+            self.month_vars[i+1] = var 
         self.btn_salvar = ttk.Button(add_frame, text="Adicionar", command=self.salvar_recorrencia); self.btn_salvar.grid(row=0, column=6, rowspan=3, padx=10, pady=2, sticky="nswe")
         ttk.Button(add_frame, text="Limpar", command=self.limpar_campos).grid(row=0, column=7, rowspan=3, padx=(0,10), pady=2, sticky="nswe")
         ttk.Button(add_frame, text="Limpar Filtros", command=self.limpar_filtros).grid(row=0, column=8, rowspan=3, padx=(0, 10), pady=2, sticky="nswe")
-        
         add_frame.grid_columnconfigure(1, weight=1); self.edit_id = None; self.carregar_recorrencias()
 
+    # --- MÉTODO MODIFICADO (Feature 2) ---
     def carregar_recorrencias(self):
         for i in self.tree.get_children(): self.tree.delete(i)
         
@@ -987,24 +1087,45 @@ class RecorrenciasWindow:
                         cell_value = float(self._get_formatted_cell_value(row, col_name))
                     else:
                         cell_value = self._get_formatted_cell_value(row, col_name)
-                    
                     if cell_value not in allowed_values:
-                        match = False
-                        break
+                        match = False; break
                 if match:
                     display_data.append(row)
         else:
             display_data = base_data
+
+        # --- NOVA LÓGICA DE ORDENAÇÃO ---
+        if hasattr(self, 'sort_column') and self.sort_column:
+            col_index = self.colunas_map.get(self.sort_column)
+            if col_index is not None:
+                is_reverse = (self.sort_direction == 'desc')
+
+                def sort_key(row):
+                    val = row[col_index]
+                    if self.sort_column == 'Valor':
+                        return float(val.replace(",", "."))
+                    if self.sort_column == 'ID':
+                        return int(val)
+                    if self.sort_column == 'Início':
+                        return datetime.strptime(val, '%d/%m/%Y')
+                    if self.sort_column == 'Parcelas':
+                        # Ordena por "Executadas / Total" (ex: "5/12", "1/∞")
+                        parts = val.split('/')
+                        return int(parts[0]) if parts[0].isdigit() else 0
+                    return str(val).lower()
+                    
+                display_data.sort(key=sort_key, reverse=is_reverse)
+        # --- FIM DA LÓGICA DE ORDENAÇÃO ---
 
         for row in display_data:
             tipo_recorrencia = row[3] 
             tag_cor = 'receita' if tipo_recorrencia == 'Receita' else 'despesa'
             self.tree.insert("", "end", values=row, tags=(tag_cor,))
         
-        self.update_header_indicators() 
+        self.update_header_indicators() # Atualiza indicadores de filtro/ordenação
+    # --- FIM DA MODIFICAÇÃO ---
 
     def _get_base_data(self):
-        """Busca todos os dados brutos de recorrência para filtragem."""
         base_data = []
         cursor = self.conn.cursor()
         cursor.execute("SELECT id, descricao, valor, tipo, data_inicio, ocorrencias, ocorrencias_executadas FROM recorrencias WHERE user_id = ?", (self.user_id,))
@@ -1013,20 +1134,16 @@ class RecorrenciasWindow:
             parc_str = f"{row[6]}/{row[5]}" if row[5] != 0 else f"{row[6]}/∞"
             data_fmt = datetime.strptime(row[4], '%Y-%m-%d').strftime('%d/%m/%Y')
             valor_fmt = f"{row[2]:.2f}"
-            
             formatted_row = (row[0], row[1], valor_fmt, tipo_recorrencia, data_fmt, parc_str)
             base_data.append(formatted_row)
         return base_data
 
     def _get_formatted_cell_value(self, row_data, column_name):
-        """Retorna o valor da célula como string para o pop-up de filtro."""
         col_index = self.colunas_map.get(column_name)
-        if col_index is None:
-            return ""
+        if col_index is None: return ""
         return str(row_data[col_index])
 
     def open_filter_popup(self, column):
-        """Abre o pop-up de filtro para a coluna clicada."""
         base_data = self._get_base_data()
         
         other_filters = {k: v for k, v in self.active_filters.items() if k != column}
@@ -1041,12 +1158,10 @@ class RecorrenciasWindow:
             unique_values = {self._get_formatted_cell_value(row, column) for row in filtered_subset}
             
         checked_values = self.active_filters.get(column, unique_values)
-        
         FilterPopup(self.root, column, unique_values, checked_values, self.apply_filter)
 
     def apply_filter(self, column, selected_values):
-        """Callback do FilterPopup para aplicar os filtros selecionados."""
-        base_data = self._get_base_data() # Recarregar dados base
+        base_data = self._get_base_data() 
         
         if column == "Valor":
             all_possible = {float(self._get_formatted_cell_value(row, column)) for row in base_data}
@@ -1060,17 +1175,88 @@ class RecorrenciasWindow:
         
         self.carregar_recorrencias() 
 
+    # --- MÉTODO MODIFICADO (Feature 2) ---
     def update_header_indicators(self):
-        """Adiciona o indicador '▾' aos cabeçalhos com filtros ativos."""
+        """Adiciona o indicador '▾' (filtro) e '▲'/'▼' (sort) aos cabeçalhos."""
+        # Garante que o mapa de colunas inclua "Início"
+        if "Início" not in self.colunas_map:
+             self.colunas_map["Início"] = 4 
+
         for col_name in self.colunas_map.keys():
-            text = col_name + (" ▾" if col_name in self.active_filters else "")
+            text = col_name
+            # 1. Indicador de Filtro
+            if col_name in self.active_filters:
+                text += " ▾"
+            # 2. Indicador de Ordenação
+            if hasattr(self, 'sort_column') and self.sort_column == col_name:
+                text += " ▲" if self.sort_direction == 'asc' else " ▼"
             self.tree.heading(col_name, text=text)
+    # --- FIM DA MODIFICAÇÃO ---
     
+    # --- MÉTODO MODIFICADO (Feature 2) ---
     def limpar_filtros(self):
         """Limpa todos os filtros ativos e recarrega a lista."""
         self.active_filters.clear()
+        # --- NOVO: Resetar ordenação ---
+        self.sort_column = None
+        self.sort_direction = "asc"
+        # --- FIM NOVO ---
+        self.carregar_recorrencias()
+    # --- FIM DA MODIFICAÇÃO ---
+
+    # --- NOVOS MÉTODOS (Feature 2 e 3) ---
+    def on_tree_press(self, event):
+        """Armazena a região do clique para diferenciar clique de arrastar."""
+        self._was_dragged = False
+        self._click_region = self.tree.identify("region", event.x, event.y)
+
+    def on_tree_drag(self, event):
+        """Marca como 'arrastado' se o mouse se mover após clicar no cabeçalho."""
+        if self._click_region == "heading":
+            self._was_dragged = True
+
+    def on_tree_release(self, event):
+        """No soltar do mouse, decide se foi um clique (ordenar) ou um arrastar (mover coluna)."""
+        if self._was_dragged:
+            self._was_dragged = False
+            return 
+        
+        if self._click_region == "heading":
+            self.handle_sort_click(event)
+        # Nenhum evento de clique de célula nesta janela
+
+    def handle_sort_click(self, event):
+        """Lida com a lógica de ordenação ao clicar no cabeçalho."""
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "heading": return
+
+        col_id = self.tree.identify_column(event.x)
+        col_name = self.tree.heading(col_id, "text").split(" ")[0]
+        
+        if not col_name: return
+
+        if self.sort_column == col_name:
+            self.sort_direction = "desc" if self.sort_direction == "asc" else "asc"
+        else:
+            self.sort_column = col_name
+            self.sort_direction = "asc"
+            
         self.carregar_recorrencias()
 
+    def on_tree_right_click(self, event):
+        """Lida com cliques do botão direito: Filtro no cabeçalho, Menu de Contexto na célula."""
+        region = self.tree.identify("region", event.x, event.y)
+        
+        if region == "heading":
+            col_id = self.tree.identify_column(event.x)
+            col_name = self.tree.heading(col_id, "text").split(" ")[0]
+            if col_name:
+                self.open_filter_popup(col_name)
+        elif region == "cell" or region == "tree":
+            self.mostrar_menu(event) # Lógica original mantida
+    # --- FIM NOVOS MÉTODOS ---
+
+    # --- MÉTODO MODIFICADO (Feature 1) ---
     def salvar_recorrencia(self):
         try:
             valor = float(self.val_entry.get().replace(",", ".")); assert valor > 0
@@ -1084,8 +1270,13 @@ class RecorrenciasWindow:
         
         cursor = self.conn.cursor()
         if self.edit_id:
-            if messagebox.askyesno("Confirmar Edição", "Editar esta recorrência irá apagar e recriar todo o seu histórico de transações. Deseja continuar?", icon='warning', parent=self.root):
-                cursor.execute("DELETE FROM transacoes WHERE recorrencia_id = ? AND user_id = ?", (self.edit_id, self.user_id)); cursor.execute("DELETE FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (self.edit_id, self.user_id))
+            msg = "Editar esta recorrência irá apagar e recriar todas as transações PENDENTES.\n\nTransações já pagas NÃO serão alteradas.\n\nDeseja continuar?"
+            if messagebox.askyesno("Confirmar Edição", msg, icon='warning', parent=self.root):
+                # --- ALTERAÇÃO: Deleta apenas transações NÃO PAGAS (quitado = 0) ---
+                cursor.execute("DELETE FROM transacoes WHERE recorrencia_id = ? AND user_id = ? AND quitado = 0", (self.edit_id, self.user_id))
+                cursor.execute("DELETE FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (self.edit_id, self.user_id))
+                # --- FIM ALTERAÇÃO ---
+                
                 cursor.execute("""
                     UPDATE recorrencias 
                     SET descricao=?, valor=?, tipo=?, categoria=?, data_inicio=?, ocorrencias=?, meses_selecionados=? 
@@ -1099,14 +1290,30 @@ class RecorrenciasWindow:
             """, (self.user_id, desc, valor, tipo, cat, data_inicio, ocorrencias, meses_db))
             
         self.conn.commit(); self.limpar_campos(); self.carregar_recorrencias(); self.refresh_callback()
+    # --- FIM DA MODIFICAÇÃO ---
 
+    # --- MÉTODO MODIFICADO (Feature 1) ---
     def excluir_recorrencia(self):
         if not self.tree.selection(): return
         rec_id = self.tree.item(self.tree.selection()[0], 'values')[0]
-        if messagebox.askyesno("Confirmar Exclusão", "Isso irá apagar PERMANENTEMENTE esta recorrência e TODAS as transações já lançadas por ela. Deseja continuar?", icon='warning', parent=self.root):
+        
+        msg = "Isso irá apagar a REGRA de recorrência e todas as transações PENDENTES associadas.\n\nTransações já pagas serão mantidas no histórico, mas desvinculadas desta regra.\n\nDeseja continuar?"
+        if messagebox.askyesno("Confirmar Exclusão", msg, icon='warning', parent=self.root):
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM transacoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id)); cursor.execute("DELETE FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id)); cursor.execute("DELETE FROM recorrencias WHERE id = ? AND user_id = ?", (rec_id, self.user_id))
+            
+            # --- NOVAS REGRAS DE EXCLUSÃO (Feature 1) ---
+            # 1. Deleta apenas transações pendentes
+            cursor.execute("DELETE FROM transacoes WHERE recorrencia_id = ? AND user_id = ? AND quitado = 0", (rec_id, self.user_id))
+            # 2. Desvincula (orfana) transações pagas
+            cursor.execute("UPDATE transacoes SET recorrencia_id = NULL WHERE recorrencia_id = ? AND user_id = ? AND quitado = 1", (rec_id, self.user_id))
+            # 3. Deleta as exclusões (pois a regra não existe mais)
+            cursor.execute("DELETE FROM recorrencia_exclusoes WHERE recorrencia_id = ? AND user_id = ?", (rec_id, self.user_id))
+            # 4. Deleta a regra de recorrência
+            cursor.execute("DELETE FROM recorrencias WHERE id = ? AND user_id = ?", (rec_id, self.user_id))
+            # --- FIM DAS NOVAS REGRAS ---
+            
             self.conn.commit(); self.carregar_recorrencias(); self.refresh_callback()
+    # --- FIM DA MODIFICAÇÃO ---
 
     def duplicar_recorrencia(self):
         if not self.tree.selection(): return
@@ -1147,7 +1354,6 @@ class RecorrenciasWindow:
         self.desc_entry.delete(0, tk.END); self.val_entry.delete(0, tk.END)
         self.cat_entry.delete(0, tk.END); self.parc_entry.delete(0, tk.END); self.parc_entry.insert(0, "0")
         self.data_entry.set_date(datetime.now()); self.btn_salvar.config(text="Adicionar")
-        
         for var in self.month_vars.values():
             var.set(False)
 
