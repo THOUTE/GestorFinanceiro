@@ -833,7 +833,10 @@ class GestorFinanceiroApp:
         current_year = str(datetime.now().year)
         if current_year not in anos: anos.insert(0, current_year)
         self.filtro_ano_combo['values'] = anos
-        if not self.filtro_ano_var.get(): self.filtro_ano_var.set(anos[0])
+        # --- ALTERAÇÃO SOLICITADA ---
+        # Define o ano padrão como o ano atual, em vez do último ano com dados
+        if not self.filtro_ano_var.get(): self.filtro_ano_var.set(current_year)
+        # --- FIM DA ALTERAÇÃO ---
 
     def mostrar_menu_contexto(self, event):
         item_id = self.tree.identify_row(event.y)
